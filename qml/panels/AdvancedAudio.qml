@@ -1028,6 +1028,39 @@ Item {
   PwObjectTracker { objects: root.outputDevice ? [root.outputDevice] : [] }
   PwObjectTracker { objects: root.inputDevice ? [root.inputDevice] : [] }
 
+  // Signal meters tap only while the window is open; the null-sink/AUX
+  // guards in inputPeakSupported apply to sink taps alike.
+  PwNodePeakMonitor {
+    id: outputSignalMonitor
+    node: Model.inputPeakSupported(root.outputDevice) ? root.outputDevice : null
+    enabled: window.visible && !!node
+  }
+  PwNodePeakMonitor {
+    id: inputSignalMonitor
+    node: Model.inputPeakSupported(root.inputDevice) ? root.inputDevice : null
+    enabled: window.visible && !!node
+  }
+
+  function deviceAudioVolumes(node) {
+    try { return node && node.audio && node.audio.volumes ? node.audio.volumes : [] }
+    catch (_error) { return [] }
+  }
+  function deviceAudioVolume(node) {
+    try { var v = Number(node.audio.volume); return isFinite(v) ? v : 0 }
+    catch (_error) { return 0 }
+  }
+  function deviceAudioMuted(node) {
+    try { return node.audio.muted === true } catch (_error) { return false }
+  }
+  readonly property real outputSignalLevel: mutableAudioNode(outputDevice)
+    ? Model.audioMeterLevel(outputSignalMonitor.peaks, deviceAudioVolumes(outputDevice),
+      outputSignalMonitor.peak, deviceAudioVolume(outputDevice), deviceAudioMuted(outputDevice))
+    : 0
+  readonly property real inputSignalLevel: mutableAudioNode(inputDevice)
+    ? Model.audioMeterLevel(inputSignalMonitor.peaks, deviceAudioVolumes(inputDevice),
+      inputSignalMonitor.peak, deviceAudioVolume(inputDevice), deviceAudioMuted(inputDevice))
+    : 0
+
   AudioMicrophoneTestController {
     id: microphoneTest
     service: root.service
@@ -2363,6 +2396,73 @@ Item {
                     onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(inputBalanceRow)
                     onCursorRequested: root.setCursor(inputBalanceRow.rowIndex)
                     onBalanceMoved: function(value) { root.setBalance(root.inputDevice, value) }
+                  }
+                }
+
+                PanelSeparator {
+                  visible: root.activeTab === 0 && (root.outputDevice || root.inputDevice)
+                  foreground: root.foreground
+                }
+
+                Column {
+                  visible: root.activeTab === 0 && (root.outputDevice || root.inputDevice)
+                  width: parent.width
+                  spacing: Style.space(8)
+
+                  PanelSectionHeader {
+                    text: "SIGNAL LEVEL"
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                  }
+
+                  Row {
+                    visible: !!root.outputDevice
+                    width: parent.width
+                    spacing: Style.space(8)
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: "Output"
+                      color: Qt.darker(root.foreground, 1.35)
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      width: Style.space(48)
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+
+                    AudioMeterBar {
+                      width: parent.width - Style.space(48) - parent.spacing
+                      anchors.verticalCenter: parent.verticalCenter
+                      level: root.outputSignalLevel
+                      foreground: root.foreground
+                      urgent: root.urgent
+                      active: !root.deviceAudioMuted(root.outputDevice)
+                    }
+                  }
+
+                  Row {
+                    visible: !!root.inputDevice
+                    width: parent.width
+                    spacing: Style.space(8)
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: "Input"
+                      color: Qt.darker(root.foreground, 1.35)
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      width: Style.space(48)
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+
+                    AudioMeterBar {
+                      width: parent.width - Style.space(48) - parent.spacing
+                      anchors.verticalCenter: parent.verticalCenter
+                      level: root.inputSignalLevel
+                      foreground: root.foreground
+                      urgent: root.urgent
+                      active: !root.inputDeviceMuted
+                    }
                   }
                 }
 

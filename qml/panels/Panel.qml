@@ -66,6 +66,8 @@ Panel {
   property bool sceneFeedbackIsError: false
   property real inputPeakHold: 0
   property bool inputClipping: false
+  property real outputPeakHold: 0
+  property bool outputClipping: false
   readonly property real outputVolumeMaximum: outputOverdrive ? 1.5 : 1.0
   onOutputOverdriveChanged: enforceOutputVolumeLimit()
 
@@ -188,6 +190,11 @@ Panel {
     var value = Number(inputPeakMonitor.peak)
     return isFinite(value) ? Math.max(0, Math.min(1, value)) : 0
   }
+  readonly property real outputPeakLevel: {
+    if (outputMuted) return 0
+    var value = Number(outputPeakMonitor.peak)
+    return isFinite(value) ? Math.max(0, Math.min(1, value)) : 0
+  }
   readonly property color urgent: bar ? bar.urgent : Commons.Color.urgent
   readonly property string recordingTooltip: {
     var microphoneAction = hasInput
@@ -219,6 +226,20 @@ Panel {
   onInputMutedChanged: if (inputMuted) {
     inputPeakHold = 0
     inputClipping = false
+  }
+  onOutputPeakLevelChanged: {
+    if (outputPeakLevel > outputPeakHold) {
+      outputPeakHold = outputPeakLevel
+      outputPeakHoldTimer.restart()
+    }
+    if (outputPeakLevel >= 0.98) {
+      outputClipping = true
+      outputClippingTimer.restart()
+    }
+  }
+  onOutputMutedChanged: if (outputMuted) {
+    outputPeakHold = 0
+    outputClipping = false
   }
 
   // Feed Repeaters with panel-local snapshots instead of the live PipeWire
@@ -541,13 +562,23 @@ Panel {
     if (focusSection === "output") {
       if (selectedIndex === -1) { toggleOutputMute(); return }
       var sink = displayAudioSinks[selectedIndex]
-      if (sink) setDefaultSink(sink)
+      if (!sink) return
+      // Activating the already-default card drills into it instead of
+      // re-applying the same default; everything else still switches.
+      if (Model.nodeName(sink) === root.preferredOutputName) {
+        var sinkRow = sinkRepeater.itemAt(selectedIndex)
+        if (sinkRow) sinkRow.expanded = !sinkRow.expanded
+      } else setDefaultSink(sink)
       return
     }
     if (focusSection === "input") {
       if (selectedIndex === -1) { toggleInputMute(); return }
       var src = displayAudioSources[selectedIndex]
-      if (src) setDefaultSource(src)
+      if (!src) return
+      if (Model.nodeName(src) === root.preferredInputName) {
+        var sourceRow = sourceRepeater.itemAt(selectedIndex)
+        if (sourceRow) sourceRow.expanded = !sourceRow.expanded
+      } else setDefaultSource(src)
       return
     }
     if (focusSection === "streams" && selectedIndex >= 0) {
@@ -1028,6 +1059,15 @@ Panel {
     enabled: (root.opened || root.recordingApplicationCount > 0) && !!node
   }
 
+  // Taps whatever node the output slider drives so a DSP chain meters the
+  // audible device, not the virtual one. The inputPeakSupported guards
+  // (null-audio-sink factory, all-AUX positions) apply to sink taps alike.
+  PwNodePeakMonitor {
+    id: outputPeakMonitor
+    node: Model.inputPeakSupported(root.volumeSink) ? root.volumeSink : null
+    enabled: root.opened && !!node
+  }
+
   AudioSceneController {
     id: sceneController
     service: root.audioService
@@ -1083,6 +1123,20 @@ Panel {
     interval: 2500
     repeat: false
     onTriggered: root.inputClipping = false
+  }
+
+  Timer {
+    id: outputPeakHoldTimer
+    interval: 1200
+    repeat: false
+    onTriggered: root.outputPeakHold = 0
+  }
+
+  Timer {
+    id: outputClippingTimer
+    interval: 2500
+    repeat: false
+    onTriggered: root.outputClipping = false
   }
 
 
@@ -1411,27 +1465,43 @@ Panel {
             CursorSurface {
               id: outputSliderRow
               width: parent.width
-              height: outputSlider.implicitHeight + Style.spacing.controlGap
+              height: outputControls.implicitHeight + Style.spacing.controlGap
               hasCursor: root.cursorActive && root.focusSection === "output" && root.selectedIndex === -1
               onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(outputSliderRow)
               foreground: root.bar.foreground
               outline: true
 
-              AudioSlider {
-                id: outputSlider
-                bar: root.bar
+              Column {
+                id: outputControls
                 anchors.fill: parent
                 anchors.leftMargin: Style.space(6)
                 anchors.rightMargin: Style.space(6)
-                minimum: 0
-                maximum: root.outputVolumeMaximum
-                step: 0.05
-                value: root.outputVolume
-                opacity: root.outputMuted ? 0.5 : 1.0
-                enabled: root.hasOutput && !root.directDeviceMutationBusy
+                spacing: Style.space(5)
 
-                onMoved: function(v) { root.setOutputVolume(v) }
-                onRightClicked: root.toggleOutputMute()
+                AudioSlider {
+                  id: outputSlider
+                  bar: root.bar
+                  width: parent.width
+                  minimum: 0
+                  maximum: root.outputVolumeMaximum
+                  step: 0.05
+                  value: root.outputVolume
+                  opacity: root.outputMuted ? 0.5 : 1.0
+                  enabled: root.hasOutput && !root.directDeviceMutationBusy
+
+                  onMoved: function(v) { root.setOutputVolume(v) }
+                  onRightClicked: root.toggleOutputMute()
+                }
+
+                AudioMeterBar {
+                  width: parent.width
+                  level: root.outputPeakLevel
+                  peakHold: root.outputPeakHold
+                  clipping: root.outputClipping
+                  foreground: root.bar.foreground
+                  urgent: root.urgent
+                  active: !root.outputMuted && root.hasOutput
+                }
               }
 
               HoverHandler {
@@ -1444,9 +1514,10 @@ Panel {
             }
 
             Repeater {
+              id: sinkRepeater
               model: sinkRows
 
-              AudioSinkRow {
+              AudioDeviceCard {
                 id: sinkDelegate
                 required property int index
                 required property string nodeKey
@@ -1456,7 +1527,14 @@ Panel {
                 bar: root.bar
                 preferredName: root.preferredOutputName
                 label: root.nodeLabel(sinkDelegate.node)
+                section: "output"
                 outputGroup: Model.isOutputGroupSink(sinkDelegate.node)
+                service: root.audioService
+                volumeMaximum: root.outputVolumeMaximum
+                metered: sinkDelegate.node === root.volumeSink
+                meterLevel: root.outputPeakLevel
+                meterPeakHold: root.outputPeakHold
+                meterClipping: root.outputClipping
                 hasCursor: root.cursorActive && root.focusSection === "output"
                   && root.selectedIndex === sinkDelegate.rowIndex
                 onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(sinkDelegate)
@@ -1469,6 +1547,7 @@ Panel {
                   root.selectedIndex = index
                 }
                 onActivated: function(node) { root.setDefaultSink(node) }
+                onExpandToggled: sinkDelegate.expanded = !sinkDelegate.expanded
               }
             }
           }
@@ -1546,28 +1625,14 @@ Panel {
                   onRightClicked: root.toggleInputMute()
                 }
 
-                Rectangle {
+                AudioMeterBar {
                   width: parent.width
-                  height: Math.max(Style.space(5), Style.spacing.xs)
-                  color: Util.alpha(root.bar.foreground, 0.18)
-                  opacity: root.inputMuted ? 0.35 : 1.0
-
-                  Rectangle {
-                    height: parent.height
-                    width: parent.width * root.inputPeakLevel
-                    color: root.inputClipping ? root.urgent : root.bar.foreground
-                    Behavior on width { NumberAnimation { duration: 70 } }
-                  }
-
-                  Rectangle {
-                    visible: root.inputPeakHold > 0.02
-                    width: Math.max(1, Style.space(2))
-                    height: parent.height + Style.space(4)
-                    x: Math.max(0, Math.min(parent.width - width,
-                      parent.width * root.inputPeakHold - width / 2))
-                    anchors.verticalCenter: parent.verticalCenter
-                    color: root.inputPeakHold >= 0.98 ? root.urgent : root.bar.foreground
-                  }
+                  level: root.inputPeakLevel
+                  peakHold: root.inputPeakHold
+                  clipping: root.inputClipping
+                  foreground: root.bar.foreground
+                  urgent: root.urgent
+                  active: !root.inputMuted
                 }
               }
 
@@ -1581,9 +1646,10 @@ Panel {
             }
 
             Repeater {
+              id: sourceRepeater
               model: sourceRows
 
-              AudioSourceRow {
+              AudioDeviceCard {
                 id: sourceDelegate
                 required property int index
                 required property string nodeKey
@@ -1593,6 +1659,14 @@ Panel {
                 bar: root.bar
                 preferredName: root.preferredInputName
                 label: root.nodeLabel(sourceDelegate.node)
+                section: "input"
+                outputGroup: false
+                service: root.audioService
+                volumeMaximum: 1.0
+                metered: sourceDelegate.node === root.source
+                meterLevel: root.inputPeakLevel
+                meterPeakHold: root.inputPeakHold
+                meterClipping: root.inputClipping
                 hasCursor: root.cursorActive && root.focusSection === "input"
                   && root.selectedIndex === sourceDelegate.rowIndex
                 onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(sourceDelegate)
@@ -1605,6 +1679,7 @@ Panel {
                   root.selectedIndex = index
                 }
                 onActivated: function(node) { root.setDefaultSource(node) }
+                onExpandToggled: sourceDelegate.expanded = !sourceDelegate.expanded
               }
             }
           }
