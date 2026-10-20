@@ -1,4 +1,4 @@
-import QtQuick
+import QtQuick 6.11
 import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
@@ -114,6 +114,8 @@ Item {
   property string portSetError: ""
   property bool portSetPending: false
   property string settingsSaveError: ""
+  property string nodeSetError: ""
+  property string policySetError: ""
   readonly property string settingsFormatError: service && service.storeErrors.settings ? service.storeErrors.settings.message : ""
   readonly property bool audioControlSettingsWritable: !!service && service.ready && !service.storeErrors.settings
   property bool audioControlWritePending: false
@@ -123,11 +125,11 @@ Item {
   readonly property string policyError: policy.error
   readonly property string error: {
     var errors = activeTab === 0
-      ? [profileSetError, portSetError, settingsSaveError, settingsFormatError]
+      ? [profileSetError, portSetError, nodeSetError, settingsSaveError, settingsFormatError]
       : (activeTab === 1
         ? [profileSetError, policyError]
         : (activeTab === 2
-          ? [settingsSaveError, settingsFormatError, policyError] : []))
+          ? [policySetError, settingsSaveError, settingsFormatError, policyError] : []))
     for (var i = 0; i < errors.length; i++) if (errors[i] !== "") return errors[i]
     return ""
   }
@@ -333,7 +335,14 @@ Item {
   }
 
   function setOutputGroupMemberVolume(node, value) {
-    if (audioMutationBusy || routingMutation || !mutableAudioNode(node)) return false
+    if (audioMutationBusy || routingMutation) {
+      showRoutingStatus("Audio is applying another change; retry in a moment", true)
+      return false
+    }
+    if (!mutableAudioNode(node)) {
+      showRoutingStatus("Device just changed; retry in a moment", true)
+      return false
+    }
     var requested = Number(value)
     var maximum = outputOverdrive ? 1.5 : 1.0
     if (!isFinite(requested)) return false
@@ -379,7 +388,11 @@ Item {
   }
 
   function adjustPolicyVolumeAtCursor(delta) {
-    if (activeTab !== 2 || policyMutationBlocked) return false
+    if (activeTab !== 2) return false
+    if (policyMutationBlocked) {
+      policySetError = "Audio is applying another change; retry in a moment"
+      return false
+    }
     var index = selectedIndex - policyVolumeStartIndex
     if (index < 0 || index >= availablePolicyVolumes.length) return false
     var definition = availablePolicyVolumes[index]
@@ -389,12 +402,19 @@ Item {
   }
 
   function setPolicySetting(key, value) {
-    if (policyMutationBlocked) return
+    if (policyMutationBlocked) {
+      policySetError = "Audio is applying another change; retry in a moment"
+      return
+    }
+    policySetError = ""
     policy.setSetting(key, value)
   }
 
   function setOutputOverdrive(enabled) {
-    if (audioMutationBusy) return
+    if (audioMutationBusy) {
+      settingsSaveError = "Audio is applying another change; retry in a moment"
+      return
+    }
     setAudioControlSetting("outputOverdrive", enabled)
   }
 
@@ -404,8 +424,16 @@ Item {
 
   function setAudioControlSetting(key, value) {
     if (!audioControlSettingsWritable || audioControlWritePending
-        || (key !== "outputOverdrive" && key !== "captureNotifications")) return
-    if (!service || !service.ready) return
+        || (key !== "outputOverdrive" && key !== "captureNotifications")) {
+      settingsSaveError = audioControlWritePending
+        ? "Audio is applying another change; retry in a moment"
+        : "Audio settings are not available right now"
+      return
+    }
+    if (!service || !service.ready) {
+      settingsSaveError = "Audio service is not ready"
+      return
+    }
     audioControlWritePending = true
     settingsSaveError = ""
     service.request("settings.set", { key: key, value: value }, function(_result, failure) {
@@ -468,7 +496,14 @@ Item {
   }
 
   function setBalance(node, value) {
-    if (audioMutationBusy || !mutableAudioNode(node)) return false
+    if (audioMutationBusy) {
+      nodeSetError = "Audio is applying another change; retry in a moment"
+      return false
+    }
+    if (!mutableAudioNode(node)) {
+      nodeSetError = "Device just changed; retry in a moment"
+      return false
+    }
     var indices = stereoIndices(node)
     if (indices.left < 0 || indices.right < 0) return false
     try {
@@ -479,7 +514,10 @@ Item {
   }
 
   function adjustBalanceAtCursor(delta) {
-    if (audioMutationBusy) return false
+    if (audioMutationBusy) {
+      nodeSetError = "Audio is applying another change; retry in a moment"
+      return false
+    }
     var node = selectedIndex === outputBalanceIndex ? outputDevice
       : (selectedIndex === inputBalanceIndex ? inputDevice : null)
     if (!node) return false
@@ -655,7 +693,10 @@ Item {
     }
     if (activeTab === 0 && selectedIndex === microphoneTestIndex) {
       if (profileSetPending || portSetPending || sceneController.busy
-          || policy.busy || diagnosticsMutationBusy) return
+          || policy.busy || diagnosticsMutationBusy) {
+        nodeSetError = "Audio is applying another change; retry in a moment"
+        return
+      }
       microphoneTest.activate()
       return
     }
@@ -712,7 +753,14 @@ Item {
   }
 
   function setAudioProfile(card, profile) {
-    if (!card || !card.identity || !profile || !service || audioMutationBusy) return
+    if (audioMutationBusy) {
+      profileSetError = "Audio is applying another change; retry in a moment"
+      return
+    }
+    if (!card || !card.identity || !profile || !service) {
+      profileSetError = service ? "Device just changed; retry in a moment" : "Audio service is not ready"
+      return
+    }
     profileSetError = ""
     profileSetPending = true
     service.request("profile.set", { identity: card.identity, profile: profile }, function(result, failure) {
@@ -722,7 +770,14 @@ Item {
   }
 
   function setAudioPort(port, value) {
-    if (!port || !port.identity || !value || !service || audioMutationBusy) return
+    if (audioMutationBusy) {
+      portSetError = "Audio is applying another change; retry in a moment"
+      return
+    }
+    if (!port || !port.identity || !value || !service) {
+      portSetError = service ? "Port just changed; retry in a moment" : "Audio service is not ready"
+      return
+    }
     portSetError = ""
     portSetPending = true
     service.request("port.set", { identity: port.identity, port: value }, function(_result, failure) {
@@ -753,7 +808,9 @@ Item {
 
   function runRuleWrite(args) {
     routingStatus = ""
-    return rulesStore.write(args)
+    var ok = rulesStore.write(args)
+    if (!ok) showRoutingStatus("Another routing change is still finishing", true)
+    return ok
   }
 
   AudioSceneController {
@@ -824,21 +881,32 @@ Item {
   }
 
   function saveCurrentScene() {
-    if (sceneMutationBusy) return
+    if (sceneMutationBusy) {
+      showSceneStatus("Audio is applying another change; retry in a moment", true)
+      return
+    }
     sceneStatus = ""
     sceneController.capture(nextSceneName())
   }
 
   function applySceneAt(index) {
     var scene = index >= 0 ? audioScenes[index] : null
-    if (!scene || sceneMutationBusy) return
+    if (!scene) return
+    if (sceneMutationBusy) {
+      showSceneStatus("Audio is applying another change; retry in a moment", true)
+      return
+    }
     sceneStatus = ""
     sceneController.apply(scene)
   }
 
   function deleteSceneAt(index) {
     var scene = index >= 0 ? audioScenes[index] : null
-    if (!scene || sceneMutationBusy) return
+    if (!scene) return
+    if (sceneMutationBusy) {
+      showSceneStatus("Audio is applying another change; retry in a moment", true)
+      return
+    }
     sceneStatus = ""
     sceneWritePending = true
     service.request("scenes.delete", { name: scene.name }, function(_result, error) {
@@ -877,14 +945,25 @@ Item {
   function createOutputGroup() {
     var name = String(newOutputGroupName || "").trim()
     var members = Model.listSnapshot(newOutputGroupMembers)
-    if (name === "" || members.length < 2 || routingMutation) return
+    if (routingMutation) {
+      showOutputGroupStatus("Another routing change is still finishing", true)
+      return
+    }
+    if (name === "" || members.length < 2) {
+      showOutputGroupStatus("Name the group and pick at least two devices", true)
+      return
+    }
     outputGroupStatus = ""
     if (!outputGroupController.createGroup(name, members))
       showOutputGroupStatus("Another routing change is still finishing", true)
   }
 
   function updateOutputGroup(group, members) {
-    if (!group || routingMutation) return
+    if (!group) return
+    if (routingMutation) {
+      showOutputGroupStatus("Another routing change is still finishing", true)
+      return
+    }
     var next = Model.listSnapshot(members)
     if (next.length < 2) {
       showOutputGroupStatus("An output group needs at least two devices", true)
@@ -896,7 +975,11 @@ Item {
   }
 
   function deleteOutputGroup(group) {
-    if (!group || routingMutation) return
+    if (!group) return
+    if (routingMutation) {
+      showOutputGroupStatus("Another routing change is still finishing", true)
+      return
+    }
     outputGroupStatus = ""
     if (!outputGroupController.deleteGroup(group.id))
       showOutputGroupStatus("Another routing change is still finishing", true)
@@ -923,7 +1006,6 @@ Item {
   function commitAliasEdit(name, text) {
     var trimmed = String(text || "").trim()
     if (runRuleWrite(["set-alias", name, trimmed])) cancelAliasEdit()
-    else showRoutingStatus("Another routing change is still finishing", true)
   }
 
   function toggleDeviceFavorite(name, currentFavorite) {
