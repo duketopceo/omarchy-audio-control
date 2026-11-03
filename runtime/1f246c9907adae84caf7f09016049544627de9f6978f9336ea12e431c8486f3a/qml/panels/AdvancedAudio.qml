@@ -1,4 +1,4 @@
-import QtQuick
+import QtQuick 6.11
 import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
@@ -114,6 +114,8 @@ Item {
   property string portSetError: ""
   property bool portSetPending: false
   property string settingsSaveError: ""
+  property string nodeSetError: ""
+  property string policySetError: ""
   readonly property string settingsFormatError: service && service.storeErrors.settings ? service.storeErrors.settings.message : ""
   readonly property bool audioControlSettingsWritable: !!service && service.ready && !service.storeErrors.settings
   property bool audioControlWritePending: false
@@ -123,11 +125,11 @@ Item {
   readonly property string policyError: policy.error
   readonly property string error: {
     var errors = activeTab === 0
-      ? [profileSetError, portSetError, settingsSaveError, settingsFormatError]
+      ? [profileSetError, portSetError, nodeSetError, settingsSaveError, settingsFormatError]
       : (activeTab === 1
         ? [profileSetError, policyError]
         : (activeTab === 2
-          ? [settingsSaveError, settingsFormatError, policyError] : []))
+          ? [policySetError, settingsSaveError, settingsFormatError, policyError] : []))
     for (var i = 0; i < errors.length; i++) if (errors[i] !== "") return errors[i]
     return ""
   }
@@ -333,7 +335,14 @@ Item {
   }
 
   function setOutputGroupMemberVolume(node, value) {
-    if (audioMutationBusy || routingMutation || !mutableAudioNode(node)) return false
+    if (audioMutationBusy || routingMutation) {
+      showRoutingStatus("Audio is applying another change; retry in a moment", true)
+      return false
+    }
+    if (!mutableAudioNode(node)) {
+      showRoutingStatus("Device just changed; retry in a moment", true)
+      return false
+    }
     var requested = Number(value)
     var maximum = outputOverdrive ? 1.5 : 1.0
     if (!isFinite(requested)) return false
@@ -364,6 +373,12 @@ Item {
     target: root.service
     function onProfilesChanged() { root.refreshDeviceCatalog() }
     function onPortsChanged() { root.refreshDeviceCatalog() }
+    function onQuickPanelOpened() {
+      // A quick-panel summon can arrive through this window's proxy. Close
+      // only the advanced surface, without toggling the newly opened mixer.
+      root.quickPanelProxyOpen = false
+      root.close()
+    }
   }
 
   function policyToggleAtCursor() {
@@ -379,7 +394,11 @@ Item {
   }
 
   function adjustPolicyVolumeAtCursor(delta) {
-    if (activeTab !== 2 || policyMutationBlocked) return false
+    if (activeTab !== 2) return false
+    if (policyMutationBlocked) {
+      policySetError = "Audio is applying another change; retry in a moment"
+      return false
+    }
     var index = selectedIndex - policyVolumeStartIndex
     if (index < 0 || index >= availablePolicyVolumes.length) return false
     var definition = availablePolicyVolumes[index]
@@ -389,12 +408,19 @@ Item {
   }
 
   function setPolicySetting(key, value) {
-    if (policyMutationBlocked) return
+    if (policyMutationBlocked) {
+      policySetError = "Audio is applying another change; retry in a moment"
+      return
+    }
+    policySetError = ""
     policy.setSetting(key, value)
   }
 
   function setOutputOverdrive(enabled) {
-    if (audioMutationBusy) return
+    if (audioMutationBusy) {
+      settingsSaveError = "Audio is applying another change; retry in a moment"
+      return
+    }
     setAudioControlSetting("outputOverdrive", enabled)
   }
 
@@ -404,8 +430,16 @@ Item {
 
   function setAudioControlSetting(key, value) {
     if (!audioControlSettingsWritable || audioControlWritePending
-        || (key !== "outputOverdrive" && key !== "captureNotifications")) return
-    if (!service || !service.ready) return
+        || (key !== "outputOverdrive" && key !== "captureNotifications")) {
+      settingsSaveError = audioControlWritePending
+        ? "Audio is applying another change; retry in a moment"
+        : "Audio settings are not available right now"
+      return
+    }
+    if (!service || !service.ready) {
+      settingsSaveError = "Audio service is not ready"
+      return
+    }
     audioControlWritePending = true
     settingsSaveError = ""
     service.request("settings.set", { key: key, value: value }, function(_result, failure) {
@@ -468,7 +502,14 @@ Item {
   }
 
   function setBalance(node, value) {
-    if (audioMutationBusy || !mutableAudioNode(node)) return false
+    if (audioMutationBusy) {
+      nodeSetError = "Audio is applying another change; retry in a moment"
+      return false
+    }
+    if (!mutableAudioNode(node)) {
+      nodeSetError = "Device just changed; retry in a moment"
+      return false
+    }
     var indices = stereoIndices(node)
     if (indices.left < 0 || indices.right < 0) return false
     try {
@@ -479,7 +520,10 @@ Item {
   }
 
   function adjustBalanceAtCursor(delta) {
-    if (audioMutationBusy) return false
+    if (audioMutationBusy) {
+      nodeSetError = "Audio is applying another change; retry in a moment"
+      return false
+    }
     var node = selectedIndex === outputBalanceIndex ? outputDevice
       : (selectedIndex === inputBalanceIndex ? inputDevice : null)
     if (!node) return false
@@ -655,7 +699,10 @@ Item {
     }
     if (activeTab === 0 && selectedIndex === microphoneTestIndex) {
       if (profileSetPending || portSetPending || sceneController.busy
-          || policy.busy || diagnosticsMutationBusy) return
+          || policy.busy || diagnosticsMutationBusy) {
+        nodeSetError = "Audio is applying another change; retry in a moment"
+        return
+      }
       microphoneTest.activate()
       return
     }
@@ -712,7 +759,14 @@ Item {
   }
 
   function setAudioProfile(card, profile) {
-    if (!card || !card.identity || !profile || !service || audioMutationBusy) return
+    if (audioMutationBusy) {
+      profileSetError = "Audio is applying another change; retry in a moment"
+      return
+    }
+    if (!card || !card.identity || !profile || !service) {
+      profileSetError = service ? "Device just changed; retry in a moment" : "Audio service is not ready"
+      return
+    }
     profileSetError = ""
     profileSetPending = true
     service.request("profile.set", { identity: card.identity, profile: profile }, function(result, failure) {
@@ -722,7 +776,14 @@ Item {
   }
 
   function setAudioPort(port, value) {
-    if (!port || !port.identity || !value || !service || audioMutationBusy) return
+    if (audioMutationBusy) {
+      portSetError = "Audio is applying another change; retry in a moment"
+      return
+    }
+    if (!port || !port.identity || !value || !service) {
+      portSetError = service ? "Port just changed; retry in a moment" : "Audio service is not ready"
+      return
+    }
     portSetError = ""
     portSetPending = true
     service.request("port.set", { identity: port.identity, port: value }, function(_result, failure) {
@@ -753,7 +814,9 @@ Item {
 
   function runRuleWrite(args) {
     routingStatus = ""
-    return rulesStore.write(args)
+    var ok = rulesStore.write(args)
+    if (!ok) showRoutingStatus("Another routing change is still finishing", true)
+    return ok
   }
 
   AudioSceneController {
@@ -824,21 +887,32 @@ Item {
   }
 
   function saveCurrentScene() {
-    if (sceneMutationBusy) return
+    if (sceneMutationBusy) {
+      showSceneStatus("Audio is applying another change; retry in a moment", true)
+      return
+    }
     sceneStatus = ""
     sceneController.capture(nextSceneName())
   }
 
   function applySceneAt(index) {
     var scene = index >= 0 ? audioScenes[index] : null
-    if (!scene || sceneMutationBusy) return
+    if (!scene) return
+    if (sceneMutationBusy) {
+      showSceneStatus("Audio is applying another change; retry in a moment", true)
+      return
+    }
     sceneStatus = ""
     sceneController.apply(scene)
   }
 
   function deleteSceneAt(index) {
     var scene = index >= 0 ? audioScenes[index] : null
-    if (!scene || sceneMutationBusy) return
+    if (!scene) return
+    if (sceneMutationBusy) {
+      showSceneStatus("Audio is applying another change; retry in a moment", true)
+      return
+    }
     sceneStatus = ""
     sceneWritePending = true
     service.request("scenes.delete", { name: scene.name }, function(_result, error) {
@@ -877,14 +951,25 @@ Item {
   function createOutputGroup() {
     var name = String(newOutputGroupName || "").trim()
     var members = Model.listSnapshot(newOutputGroupMembers)
-    if (name === "" || members.length < 2 || routingMutation) return
+    if (routingMutation) {
+      showOutputGroupStatus("Another routing change is still finishing", true)
+      return
+    }
+    if (name === "" || members.length < 2) {
+      showOutputGroupStatus("Name the group and pick at least two devices", true)
+      return
+    }
     outputGroupStatus = ""
     if (!outputGroupController.createGroup(name, members))
       showOutputGroupStatus("Another routing change is still finishing", true)
   }
 
   function updateOutputGroup(group, members) {
-    if (!group || routingMutation) return
+    if (!group) return
+    if (routingMutation) {
+      showOutputGroupStatus("Another routing change is still finishing", true)
+      return
+    }
     var next = Model.listSnapshot(members)
     if (next.length < 2) {
       showOutputGroupStatus("An output group needs at least two devices", true)
@@ -896,7 +981,11 @@ Item {
   }
 
   function deleteOutputGroup(group) {
-    if (!group || routingMutation) return
+    if (!group) return
+    if (routingMutation) {
+      showOutputGroupStatus("Another routing change is still finishing", true)
+      return
+    }
     outputGroupStatus = ""
     if (!outputGroupController.deleteGroup(group.id))
       showOutputGroupStatus("Another routing change is still finishing", true)
@@ -923,7 +1012,6 @@ Item {
   function commitAliasEdit(name, text) {
     var trimmed = String(text || "").trim()
     if (runRuleWrite(["set-alias", name, trimmed])) cancelAliasEdit()
-    else showRoutingStatus("Another routing change is still finishing", true)
   }
 
   function toggleDeviceFavorite(name, currentFavorite) {
@@ -945,6 +1033,39 @@ Item {
 
   PwObjectTracker { objects: root.outputDevice ? [root.outputDevice] : [] }
   PwObjectTracker { objects: root.inputDevice ? [root.inputDevice] : [] }
+
+  // Signal meters tap only while the window is open; the null-sink/AUX
+  // guards in inputPeakSupported apply to sink taps alike.
+  PwNodePeakMonitor {
+    id: outputSignalMonitor
+    node: Model.inputPeakSupported(root.outputDevice) ? root.outputDevice : null
+    enabled: window.visible && !!node
+  }
+  PwNodePeakMonitor {
+    id: inputSignalMonitor
+    node: Model.inputPeakSupported(root.inputDevice) ? root.inputDevice : null
+    enabled: window.visible && !!node
+  }
+
+  function deviceAudioVolumes(node) {
+    try { return node && node.audio && node.audio.volumes ? node.audio.volumes : [] }
+    catch (_error) { return [] }
+  }
+  function deviceAudioVolume(node) {
+    try { var v = Number(node.audio.volume); return isFinite(v) ? v : 0 }
+    catch (_error) { return 0 }
+  }
+  function deviceAudioMuted(node) {
+    try { return node.audio.muted === true } catch (_error) { return false }
+  }
+  readonly property real outputSignalLevel: mutableAudioNode(outputDevice)
+    ? Model.audioMeterLevel(outputSignalMonitor.peaks, deviceAudioVolumes(outputDevice),
+      outputSignalMonitor.peak, deviceAudioVolume(outputDevice), deviceAudioMuted(outputDevice))
+    : 0
+  readonly property real inputSignalLevel: mutableAudioNode(inputDevice)
+    ? Model.audioMeterLevel(inputSignalMonitor.peaks, deviceAudioVolumes(inputDevice),
+      inputSignalMonitor.peak, deviceAudioVolume(inputDevice), deviceAudioMuted(inputDevice))
+    : 0
 
   AudioMicrophoneTestController {
     id: microphoneTest
@@ -2281,6 +2402,73 @@ Item {
                     onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(inputBalanceRow)
                     onCursorRequested: root.setCursor(inputBalanceRow.rowIndex)
                     onBalanceMoved: function(value) { root.setBalance(root.inputDevice, value) }
+                  }
+                }
+
+                PanelSeparator {
+                  visible: root.activeTab === 0 && (root.outputDevice || root.inputDevice)
+                  foreground: root.foreground
+                }
+
+                Column {
+                  visible: root.activeTab === 0 && (root.outputDevice || root.inputDevice)
+                  width: parent.width
+                  spacing: Style.space(8)
+
+                  PanelSectionHeader {
+                    text: "SIGNAL LEVEL"
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                  }
+
+                  Row {
+                    visible: !!root.outputDevice
+                    width: parent.width
+                    spacing: Style.space(8)
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: "Output"
+                      color: Qt.darker(root.foreground, 1.35)
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      width: Style.space(48)
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+
+                    AudioMeterBar {
+                      width: parent.width - Style.space(48) - parent.spacing
+                      anchors.verticalCenter: parent.verticalCenter
+                      level: root.outputSignalLevel
+                      foreground: root.foreground
+                      urgent: root.urgent
+                      active: !root.deviceAudioMuted(root.outputDevice)
+                    }
+                  }
+
+                  Row {
+                    visible: !!root.inputDevice
+                    width: parent.width
+                    spacing: Style.space(8)
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: "Input"
+                      color: Qt.darker(root.foreground, 1.35)
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      width: Style.space(48)
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+
+                    AudioMeterBar {
+                      width: parent.width - Style.space(48) - parent.spacing
+                      anchors.verticalCenter: parent.verticalCenter
+                      level: root.inputSignalLevel
+                      foreground: root.foreground
+                      urgent: root.urgent
+                      active: !root.inputDeviceMuted
+                    }
                   }
                 }
 

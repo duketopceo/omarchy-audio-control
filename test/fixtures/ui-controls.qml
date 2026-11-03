@@ -80,7 +80,14 @@ Item {
         if (!root.check(root.managedRows().length === 0, "unused routing tab created device rows")) return
         root.advanced.newOutputGroupName = "Unfinished group"
         root.advanced.selectTab(4)
+        var advancedWindow = root.descendants(root.advanced).find(function(item) {
+          return item.title === "Advanced Audio Control"
+        })
+        if (!root.check(!!advancedWindow, "Advanced window missing")) return
+        advancedWindow.visible = true
         root.panel.open()
+        if (!root.check(!root.advanced.opened && root.panel.opened,
+            "Opening the mixer left the advanced window active")) return
         root.phase++
         break
       case 1:
@@ -301,7 +308,13 @@ Item {
         if (!root.check(!!root.advanced.profileSetError && !root.advanced.profileSetPending,
             "rejected profile selection left the control blocked or hid its error")) return
         var output = root.panel.candidateSinks.find(function(n) { return n.name === "audio_test_output" })
-        if (!root.check(!!output && root.panel.setDefaultSink(output), "default selection did not start")) return
+        var settings = root.descendants(root.panel).find(function(item) { return item.tooltipText === "Advanced audio" })
+        root.panel.defaultSetPending = true
+        var settingsEnabled = settings && settings.enabled
+        root.panel.defaultSetPending = false
+        if (!root.check(settingsEnabled, "audio navigation was disabled by a pending mutation")) return
+        var departed = {id: 4000000, properties: {"object.serial": "4000000"}}
+        if (!root.check(!!output && root.panel.setDefaultDevice(output, departed, "output"), "a stale previous default blocked selection")) return
         if (!root.check(root.panel.defaultSetPending && !root.panel.setDefaultSink(output), "default selection did not block duplicates")) return
         root.phase++
         break

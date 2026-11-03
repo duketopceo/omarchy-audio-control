@@ -1,4 +1,4 @@
-import QtQuick
+import QtQuick 6.11
 import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
@@ -66,6 +66,8 @@ Panel {
   property bool sceneFeedbackIsError: false
   property real inputPeakHold: 0
   property bool inputClipping: false
+  property real outputPeakHold: 0
+  property bool outputClipping: false
   readonly property real outputVolumeMaximum: outputOverdrive ? 1.5 : 1.0
   onOutputOverdriveChanged: enforceOutputVolumeLimit()
 
@@ -188,6 +190,11 @@ Panel {
     var value = Number(inputPeakMonitor.peak)
     return isFinite(value) ? Math.max(0, Math.min(1, value)) : 0
   }
+  readonly property real outputPeakLevel: {
+    if (outputMuted) return 0
+    var value = Number(outputPeakMonitor.peak)
+    return isFinite(value) ? Math.max(0, Math.min(1, value)) : 0
+  }
   readonly property color urgent: bar ? bar.urgent : Commons.Color.urgent
   readonly property string recordingTooltip: {
     var microphoneAction = hasInput
@@ -220,6 +227,20 @@ Panel {
     inputPeakHold = 0
     inputClipping = false
   }
+  onOutputPeakLevelChanged: {
+    if (outputPeakLevel > outputPeakHold) {
+      outputPeakHold = outputPeakLevel
+      outputPeakHoldTimer.restart()
+    }
+    if (outputPeakLevel >= 0.98) {
+      outputClipping = true
+      outputClippingTimer.restart()
+    }
+  }
+  onOutputMutedChanged: if (outputMuted) {
+    outputPeakHold = 0
+    outputClipping = false
+  }
 
   // Feed Repeaters with panel-local snapshots instead of the live PipeWire
   // model. PipeWire can remove nodes while Quickshell is dispatching the
@@ -250,15 +271,17 @@ Panel {
     ? streamRouteSetError : streamRouteReadError
   property string defaultOutputError: ""
   property string defaultInputError: ""
+  property string interactionError: ""
   readonly property string defaultDeviceError: defaultOutputError !== ""
     ? defaultOutputError : defaultInputError
   readonly property string panelError: !audioService || !audioService.ready
-    ? "Audio service is unavailable" : audioService.error !== "" ? audioService.error : defaultDeviceError !== ""
+    ? "Audio service is unavailable" : audioService.error !== "" ? audioService.error
+    : interactionError !== "" ? interactionError : defaultDeviceError !== ""
     ? defaultDeviceError : (streamRouteError !== "" ? streamRouteError
       : (outputGroups.error !== "" ? outputGroups.error : rulesStore.error))
   property var pendingStreamRoute: null
   property bool defaultSetPending: false
-  readonly property bool routeMutationBusy: !audioService || !audioService.ready || audioService.busy || defaultSetPending
+  readonly property bool routeMutationBusy: !audioService || !audioService.ready || audioService.transactionBusy || defaultSetPending
     || pendingStreamRoute !== null || rulesStore.busy || outputGroups.busy
   readonly property bool directDeviceMutationBusy: !audioService || !audioService.ready || audioService.transactionBusy || sceneController.busy
     || defaultSetPending
@@ -266,6 +289,23 @@ Panel {
     enforceOutputVolumeLimit()
   readonly property bool sceneMutationBusy: sceneController.busy || routeMutationBusy
     || streamOutputMenuOpen
+
+  Timer {
+    id: interactionErrorTimer
+    interval: 6000
+    onTriggered: root.interactionError = ""
+  }
+
+  function rejectAudioAction(message) {
+    interactionError = message
+    interactionErrorTimer.restart()
+    return false
+  }
+
+  function clearInteractionError() {
+    interactionErrorTimer.stop()
+    interactionError = ""
+  }
 
 
   // The default is ordered first and named by behavior. Applications on that
@@ -505,26 +545,26 @@ Panel {
   // — the cursor is on a discrete row, not on the slider, and silently
   // moving the global slider would surprise the user.
   function adjustVolume(delta) {
-    if (directDeviceMutationBusy) return
+    var node = null
+    var maximum = outputVolumeMaximum
     if (focusSection === "output" && selectedIndex === -1) {
-      setOutputVolume(outputVolume + delta)
+      node = volumeSink
+    } else if (focusSection === "input" && selectedIndex === -1) {
+      node = source
+      maximum = 1
+    } else if (focusSection === "streams" && selectedIndex >= 0 && selectedIndex < displayAudioStreams.length) {
+      node = displayAudioStreams[selectedIndex]
+    } else if (focusSection === "recording" && selectedIndex >= 0 && selectedIndex < displayRecordingStreams.length) {
+      node = displayRecordingStreams[selectedIndex]
+      maximum = 1.5
+    } else {
       return
     }
-    if (focusSection === "input" && selectedIndex === -1) {
-      setInputVolume(inputVolume + delta)
-      return
-    }
-    if (focusSection === "streams" && selectedIndex >= 0 && selectedIndex < displayAudioStreams.length) {
-      var s = displayAudioStreams[selectedIndex]
-      var playbackVolume = audioNodeVolume(s) + Number(delta)
-      if (isFinite(playbackVolume)) setAudioNodeVolume(s, playbackVolume, outputVolumeMaximum)
-      return
-    }
-    if (focusSection === "recording" && selectedIndex >= 0 && selectedIndex < displayRecordingStreams.length) {
-      var recording = displayRecordingStreams[selectedIndex]
-      var recordingVolume = audioNodeVolume(recording) + Number(delta)
-      if (isFinite(recordingVolume)) setAudioNodeVolume(recording, recordingVolume, 1.5)
-    }
+    if (directDeviceMutationBusy)
+      return rejectAudioAction("Audio is applying another change; retry in a moment")
+    if (!setAudioNodeVolume(node, audioNodeVolume(node) + Number(delta), maximum))
+      return rejectAudioAction("That device or application just changed; retry in a moment")
+    clearInteractionError()
   }
 
   // Enter/Space: activate whatever the cursor is on.
@@ -541,13 +581,23 @@ Panel {
     if (focusSection === "output") {
       if (selectedIndex === -1) { toggleOutputMute(); return }
       var sink = displayAudioSinks[selectedIndex]
-      if (sink) setDefaultSink(sink)
+      if (!sink) return
+      // Activating the already-default card drills into it instead of
+      // re-applying the same default; everything else still switches.
+      if (Model.nodeName(sink) === root.preferredOutputName) {
+        var sinkRow = sinkRepeater.itemAt(selectedIndex)
+        if (sinkRow) sinkRow.expanded = !sinkRow.expanded
+      } else setDefaultSink(sink)
       return
     }
     if (focusSection === "input") {
       if (selectedIndex === -1) { toggleInputMute(); return }
       var src = displayAudioSources[selectedIndex]
-      if (src) setDefaultSource(src)
+      if (!src) return
+      if (Model.nodeName(src) === root.preferredInputName) {
+        var sourceRow = sourceRepeater.itemAt(selectedIndex)
+        if (sourceRow) sourceRow.expanded = !sourceRow.expanded
+      } else setDefaultSource(src)
       return
     }
     if (focusSection === "streams" && selectedIndex >= 0) {
@@ -570,7 +620,6 @@ Panel {
   }
 
   function openAdvancedAudio() {
-    if (sceneMutationBusy) return
     controller.hide()
     if (bar && bar.shell && typeof bar.shell.summon === "function")
       bar.shell.summon("ssupt.audio-control", '{"view":"advanced"}')
@@ -586,6 +635,8 @@ Panel {
 
   onOpenedChanged: {
     if (opened) {
+      if (audioService && typeof audioService.quickPanelOpened === "function")
+        audioService.quickPanelOpened()
       if (appLibrary && typeof appLibrary.refreshIcons === "function") appLibrary.refreshIcons()
       // Populate through the debounced refresh: assigning the display models
       // synchronously inside this signal regenerates every Repeater while
@@ -706,20 +757,26 @@ Panel {
   function setStreamRoute(node, optionValue, direction) {
     var streamSerialValue = streamSerial(node)
     var route = Model.parseStreamOutputOption(optionValue)
-    if (streamSerialValue === "" || route.sink === "" || route.mode === ""
-        || sceneController.busy || routeMutationBusy) return
+    if (streamSerialValue === "" || route.sink === "" || route.mode === "") {
+      return rejectAudioAction("That application or device just changed; retry in a moment")
+    }
+    if (sceneController.busy || routeMutationBusy) {
+      return rejectAudioAction("Audio is applying another change; retry in a moment")
+    }
 
     var identity = audioService.identityForNode(node)
     var targets = direction === "recording" ? candidateSources : candidateSinks
     var target = null
     for (var i = 0; i < targets.length; i++) {
       if (Model.nodeSerial(targets[i]) === route.sink) {
-        if (target) return
+        if (target) return rejectAudioAction("The audio destination is ambiguous; retry in a moment")
         target = targets[i]
       }
     }
     var targetIdentity = audioService.identityForNode(target)
-    if (!identity || !targetIdentity) return
+    if (!identity || !targetIdentity)
+      return rejectAudioAction("That application or device just changed; retry in a moment")
+    clearInteractionError()
     streamRouteSetError = ""
     pendingStreamRoute = {
       direction: direction,
@@ -841,29 +898,53 @@ Panel {
   }
 
   function toggleOutputMute() {
-    if (!directDeviceMutationBusy) toggleAudioNodeMute(volumeSink)
+    if (directDeviceMutationBusy)
+      return rejectAudioAction("Audio is applying another change; retry in a moment")
+    if (!toggleAudioNodeMute(volumeSink))
+      return rejectAudioAction("That output just changed; retry in a moment")
+    clearInteractionError()
   }
 
   function toggleInputMute() {
-    if (!directDeviceMutationBusy) toggleAudioNodeMute(source)
+    if (directDeviceMutationBusy)
+      return rejectAudioAction("Audio is applying another change; retry in a moment")
+    if (!toggleAudioNodeMute(source))
+      return rejectAudioAction("That microphone just changed; retry in a moment")
+    clearInteractionError()
   }
 
   // The hero switch is the whole panel's on/off, so it carries both channels
   // at once. It reads as on while anything is still audible, which keeps
   // muting a single channel from the row below flipping the master switch.
   function toggleAllMuted() {
-    if (directDeviceMutationBusy) return
+    if (directDeviceMutationBusy) {
+      return rejectAudioAction("Audio is applying another change; retry in a moment")
+    }
     var mute = anyAudible
-    if (hasOutput) setAudioNodeMuted(volumeSink, mute)
-    if (hasInput) setAudioNodeMuted(source, mute)
+    var outputOk = !hasOutput || setAudioNodeMuted(volumeSink, mute)
+    var inputOk = !hasInput || setAudioNodeMuted(source, mute)
+    if (!outputOk || !inputOk)
+      return rejectAudioAction("An audio device just changed; check its mute state and retry")
+    clearInteractionError()
   }
 
 
   function setDefaultDevice(node, previous, direction) {
-    if (!mutableAudioNode(node) || sceneController.busy || routeMutationBusy) return false
+    if (!mutableAudioNode(node)) {
+      return rejectAudioAction("That device just changed; wait a moment and retry")
+    }
+    if (sceneController.busy || routeMutationBusy) {
+      return rejectAudioAction("Audio is applying another change; retry in a moment")
+    }
     var identity = audioService.identityForNode(node)
-    var previousIdentity = audioService.identityForNode(previous)
-    if (!identity || (previous && !previousIdentity)) return false
+    if (!identity) {
+      return rejectAudioAction("Device snapshot is stale; wait a moment and retry")
+    }
+    // A previous default that already left the graph cannot be resolved here.
+    // The backend recomputes it from routing state, so a stale previous must
+    // never block the whole switch.
+    var previousIdentity = previous ? audioService.identityForNode(previous) : null
+    clearInteractionError()
     if (direction === "output") defaultOutputError = ""
     else defaultInputError = ""
     defaultSetPending = true
@@ -1002,6 +1083,15 @@ Panel {
     enabled: (root.opened || root.recordingApplicationCount > 0) && !!node
   }
 
+  // Taps whatever node the output slider drives so a DSP chain meters the
+  // audible device, not the virtual one. The inputPeakSupported guards
+  // (null-audio-sink factory, all-AUX positions) apply to sink taps alike.
+  PwNodePeakMonitor {
+    id: outputPeakMonitor
+    node: Model.inputPeakSupported(root.volumeSink) ? root.volumeSink : null
+    enabled: root.opened && !!node
+  }
+
   AudioSceneController {
     id: sceneController
     service: root.audioService
@@ -1030,7 +1120,12 @@ Panel {
 
   function applySceneAt(index) {
     var scene = index >= 0 ? audioScenes[index] : null
-    if (!scene || sceneMutationBusy) return
+    if (!scene) return
+    if (sceneMutationBusy) {
+      showSceneFeedback("Audio is applying another change; retry in a moment", true)
+      return
+    }
+    clearInteractionError()
     sceneController.apply(scene)
   }
 
@@ -1053,6 +1148,20 @@ Panel {
     interval: 2500
     repeat: false
     onTriggered: root.inputClipping = false
+  }
+
+  Timer {
+    id: outputPeakHoldTimer
+    interval: 1200
+    repeat: false
+    onTriggered: root.outputPeakHold = 0
+  }
+
+  Timer {
+    id: outputClippingTimer
+    interval: 2500
+    repeat: false
+    onTriggered: root.outputClipping = false
   }
 
 
@@ -1201,7 +1310,6 @@ Panel {
                 horizontalPadding: Style.space(5)
                 verticalPadding: Style.space(2)
                 hasCursor: root.settingsHeaderHasCursor
-                enabled: !root.sceneMutationBusy
                 anchors.verticalCenter: parent.verticalCenter
                 onHovered: function(on) { if (on) root.setHeaderCursor(0) }
                 onClicked: root.openAdvancedAudio()
@@ -1314,9 +1422,8 @@ Panel {
 
                   MouseArea {
                     anchors.fill: parent
-                    enabled: !root.sceneMutationBusy
                     hoverEnabled: true
-                    cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                    cursorShape: Qt.PointingHandCursor
                     onContainsMouseChanged: if (containsMouse) {
                       root.cursorActive = true
                       root.focusSection = "scenes"
@@ -1381,27 +1488,43 @@ Panel {
             CursorSurface {
               id: outputSliderRow
               width: parent.width
-              height: outputSlider.implicitHeight + Style.spacing.controlGap
+              height: outputControls.implicitHeight + Style.spacing.controlGap
               hasCursor: root.cursorActive && root.focusSection === "output" && root.selectedIndex === -1
               onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(outputSliderRow)
               foreground: root.bar.foreground
               outline: true
 
-              AudioSlider {
-                id: outputSlider
-                bar: root.bar
+              Column {
+                id: outputControls
                 anchors.fill: parent
                 anchors.leftMargin: Style.space(6)
                 anchors.rightMargin: Style.space(6)
-                minimum: 0
-                maximum: root.outputVolumeMaximum
-                step: 0.05
-                value: root.outputVolume
-                opacity: root.outputMuted ? 0.5 : 1.0
-                enabled: root.hasOutput && !root.directDeviceMutationBusy
+                spacing: Style.space(5)
 
-                onMoved: function(v) { root.setOutputVolume(v) }
-                onRightClicked: root.toggleOutputMute()
+                AudioSlider {
+                  id: outputSlider
+                  bar: root.bar
+                  width: parent.width
+                  minimum: 0
+                  maximum: root.outputVolumeMaximum
+                  step: 0.05
+                  value: root.outputVolume
+                  opacity: root.outputMuted ? 0.5 : 1.0
+                  enabled: root.hasOutput && !root.directDeviceMutationBusy
+
+                  onMoved: function(v) { root.setOutputVolume(v) }
+                  onRightClicked: root.toggleOutputMute()
+                }
+
+                AudioMeterBar {
+                  width: parent.width
+                  level: root.outputPeakLevel
+                  peakHold: root.outputPeakHold
+                  clipping: root.outputClipping
+                  foreground: root.bar.foreground
+                  urgent: root.urgent
+                  active: !root.outputMuted && root.hasOutput
+                }
               }
 
               HoverHandler {
@@ -1414,9 +1537,10 @@ Panel {
             }
 
             Repeater {
+              id: sinkRepeater
               model: sinkRows
 
-              AudioSinkRow {
+              AudioDeviceCard {
                 id: sinkDelegate
                 required property int index
                 required property string nodeKey
@@ -1426,8 +1550,14 @@ Panel {
                 bar: root.bar
                 preferredName: root.preferredOutputName
                 label: root.nodeLabel(sinkDelegate.node)
+                section: "output"
                 outputGroup: Model.isOutputGroupSink(sinkDelegate.node)
-                defaultSetBusy: root.sceneMutationBusy
+                service: root.audioService
+                volumeMaximum: root.outputVolumeMaximum
+                metered: sinkDelegate.node === root.volumeSink
+                meterLevel: root.outputPeakLevel
+                meterPeakHold: root.outputPeakHold
+                meterClipping: root.outputClipping
                 hasCursor: root.cursorActive && root.focusSection === "output"
                   && root.selectedIndex === sinkDelegate.rowIndex
                 onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(sinkDelegate)
@@ -1440,6 +1570,7 @@ Panel {
                   root.selectedIndex = index
                 }
                 onActivated: function(node) { root.setDefaultSink(node) }
+                onExpandToggled: sinkDelegate.expanded = !sinkDelegate.expanded
               }
             }
           }
@@ -1517,28 +1648,14 @@ Panel {
                   onRightClicked: root.toggleInputMute()
                 }
 
-                Rectangle {
+                AudioMeterBar {
                   width: parent.width
-                  height: Math.max(Style.space(5), Style.spacing.xs)
-                  color: Util.alpha(root.bar.foreground, 0.18)
-                  opacity: root.inputMuted ? 0.35 : 1.0
-
-                  Rectangle {
-                    height: parent.height
-                    width: parent.width * root.inputPeakLevel
-                    color: root.inputClipping ? root.urgent : root.bar.foreground
-                    Behavior on width { NumberAnimation { duration: 70 } }
-                  }
-
-                  Rectangle {
-                    visible: root.inputPeakHold > 0.02
-                    width: Math.max(1, Style.space(2))
-                    height: parent.height + Style.space(4)
-                    x: Math.max(0, Math.min(parent.width - width,
-                      parent.width * root.inputPeakHold - width / 2))
-                    anchors.verticalCenter: parent.verticalCenter
-                    color: root.inputPeakHold >= 0.98 ? root.urgent : root.bar.foreground
-                  }
+                  level: root.inputPeakLevel
+                  peakHold: root.inputPeakHold
+                  clipping: root.inputClipping
+                  foreground: root.bar.foreground
+                  urgent: root.urgent
+                  active: !root.inputMuted
                 }
               }
 
@@ -1552,9 +1669,10 @@ Panel {
             }
 
             Repeater {
+              id: sourceRepeater
               model: sourceRows
 
-              AudioSourceRow {
+              AudioDeviceCard {
                 id: sourceDelegate
                 required property int index
                 required property string nodeKey
@@ -1564,7 +1682,14 @@ Panel {
                 bar: root.bar
                 preferredName: root.preferredInputName
                 label: root.nodeLabel(sourceDelegate.node)
-                defaultSetBusy: root.sceneMutationBusy
+                section: "input"
+                outputGroup: false
+                service: root.audioService
+                volumeMaximum: 1.0
+                metered: sourceDelegate.node === root.source
+                meterLevel: root.inputPeakLevel
+                meterPeakHold: root.inputPeakHold
+                meterClipping: root.inputClipping
                 hasCursor: root.cursorActive && root.focusSection === "input"
                   && root.selectedIndex === sourceDelegate.rowIndex
                 onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(sourceDelegate)
@@ -1577,6 +1702,7 @@ Panel {
                   root.selectedIndex = index
                 }
                 onActivated: function(node) { root.setDefaultSource(node) }
+                onExpandToggled: sourceDelegate.expanded = !sourceDelegate.expanded
               }
             }
           }
