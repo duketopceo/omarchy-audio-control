@@ -271,15 +271,17 @@ Panel {
     ? streamRouteSetError : streamRouteReadError
   property string defaultOutputError: ""
   property string defaultInputError: ""
+  property string interactionError: ""
   readonly property string defaultDeviceError: defaultOutputError !== ""
     ? defaultOutputError : defaultInputError
   readonly property string panelError: !audioService || !audioService.ready
-    ? "Audio service is unavailable" : audioService.error !== "" ? audioService.error : defaultDeviceError !== ""
+    ? "Audio service is unavailable" : audioService.error !== "" ? audioService.error
+    : interactionError !== "" ? interactionError : defaultDeviceError !== ""
     ? defaultDeviceError : (streamRouteError !== "" ? streamRouteError
       : (outputGroups.error !== "" ? outputGroups.error : rulesStore.error))
   property var pendingStreamRoute: null
   property bool defaultSetPending: false
-  readonly property bool routeMutationBusy: !audioService || !audioService.ready || audioService.busy || defaultSetPending
+  readonly property bool routeMutationBusy: !audioService || !audioService.ready || audioService.transactionBusy || defaultSetPending
     || pendingStreamRoute !== null || rulesStore.busy || outputGroups.busy
   readonly property bool directDeviceMutationBusy: !audioService || !audioService.ready || audioService.transactionBusy || sceneController.busy
     || defaultSetPending
@@ -287,6 +289,23 @@ Panel {
     enforceOutputVolumeLimit()
   readonly property bool sceneMutationBusy: sceneController.busy || routeMutationBusy
     || streamOutputMenuOpen
+
+  Timer {
+    id: interactionErrorTimer
+    interval: 6000
+    onTriggered: root.interactionError = ""
+  }
+
+  function rejectAudioAction(message) {
+    interactionError = message
+    interactionErrorTimer.restart()
+    return false
+  }
+
+  function clearInteractionError() {
+    interactionErrorTimer.stop()
+    interactionError = ""
+  }
 
 
   // The default is ordered first and named by behavior. Applications on that
@@ -526,26 +545,26 @@ Panel {
   // — the cursor is on a discrete row, not on the slider, and silently
   // moving the global slider would surprise the user.
   function adjustVolume(delta) {
-    if (directDeviceMutationBusy) { defaultOutputError = "Audio is applying another change; retry in a moment"; return }
+    var node = null
+    var maximum = outputVolumeMaximum
     if (focusSection === "output" && selectedIndex === -1) {
-      setOutputVolume(outputVolume + delta)
+      node = volumeSink
+    } else if (focusSection === "input" && selectedIndex === -1) {
+      node = source
+      maximum = 1
+    } else if (focusSection === "streams" && selectedIndex >= 0 && selectedIndex < displayAudioStreams.length) {
+      node = displayAudioStreams[selectedIndex]
+    } else if (focusSection === "recording" && selectedIndex >= 0 && selectedIndex < displayRecordingStreams.length) {
+      node = displayRecordingStreams[selectedIndex]
+      maximum = 1.5
+    } else {
       return
     }
-    if (focusSection === "input" && selectedIndex === -1) {
-      setInputVolume(inputVolume + delta)
-      return
-    }
-    if (focusSection === "streams" && selectedIndex >= 0 && selectedIndex < displayAudioStreams.length) {
-      var s = displayAudioStreams[selectedIndex]
-      var playbackVolume = audioNodeVolume(s) + Number(delta)
-      if (isFinite(playbackVolume)) setAudioNodeVolume(s, playbackVolume, outputVolumeMaximum)
-      return
-    }
-    if (focusSection === "recording" && selectedIndex >= 0 && selectedIndex < displayRecordingStreams.length) {
-      var recording = displayRecordingStreams[selectedIndex]
-      var recordingVolume = audioNodeVolume(recording) + Number(delta)
-      if (isFinite(recordingVolume)) setAudioNodeVolume(recording, recordingVolume, 1.5)
-    }
+    if (directDeviceMutationBusy)
+      return rejectAudioAction("Audio is applying another change; retry in a moment")
+    if (!setAudioNodeVolume(node, audioNodeVolume(node) + Number(delta), maximum))
+      return rejectAudioAction("That device or application just changed; retry in a moment")
+    clearInteractionError()
   }
 
   // Enter/Space: activate whatever the cursor is on.
@@ -616,6 +635,8 @@ Panel {
 
   onOpenedChanged: {
     if (opened) {
+      if (audioService && typeof audioService.quickPanelOpened === "function")
+        audioService.quickPanelOpened()
       if (appLibrary && typeof appLibrary.refreshIcons === "function") appLibrary.refreshIcons()
       // Populate through the debounced refresh: assigning the display models
       // synchronously inside this signal regenerates every Repeater while
@@ -737,12 +758,10 @@ Panel {
     var streamSerialValue = streamSerial(node)
     var route = Model.parseStreamOutputOption(optionValue)
     if (streamSerialValue === "" || route.sink === "" || route.mode === "") {
-      streamRouteSetError = "Stream route is stale; reopen the panel and retry"
-      return
+      return rejectAudioAction("That application or device just changed; retry in a moment")
     }
     if (sceneController.busy || routeMutationBusy) {
-      streamRouteSetError = "Audio is applying another change; retry in a moment"
-      return
+      return rejectAudioAction("Audio is applying another change; retry in a moment")
     }
 
     var identity = audioService.identityForNode(node)
@@ -750,12 +769,14 @@ Panel {
     var target = null
     for (var i = 0; i < targets.length; i++) {
       if (Model.nodeSerial(targets[i]) === route.sink) {
-        if (target) return
+        if (target) return rejectAudioAction("The audio destination is ambiguous; retry in a moment")
         target = targets[i]
       }
     }
     var targetIdentity = audioService.identityForNode(target)
-    if (!identity || !targetIdentity) return
+    if (!identity || !targetIdentity)
+      return rejectAudioAction("That application or device just changed; retry in a moment")
+    clearInteractionError()
     streamRouteSetError = ""
     pendingStreamRoute = {
       direction: direction,
@@ -877,13 +898,19 @@ Panel {
   }
 
   function toggleOutputMute() {
-    if (directDeviceMutationBusy) { defaultOutputError = "Audio is applying another change; retry in a moment"; return }
-    toggleAudioNodeMute(volumeSink)
+    if (directDeviceMutationBusy)
+      return rejectAudioAction("Audio is applying another change; retry in a moment")
+    if (!toggleAudioNodeMute(volumeSink))
+      return rejectAudioAction("That output just changed; retry in a moment")
+    clearInteractionError()
   }
 
   function toggleInputMute() {
-    if (directDeviceMutationBusy) { defaultInputError = "Audio is applying another change; retry in a moment"; return }
-    toggleAudioNodeMute(source)
+    if (directDeviceMutationBusy)
+      return rejectAudioAction("Audio is applying another change; retry in a moment")
+    if (!toggleAudioNodeMute(source))
+      return rejectAudioAction("That microphone just changed; retry in a moment")
+    clearInteractionError()
   }
 
   // The hero switch is the whole panel's on/off, so it carries both channels
@@ -891,36 +918,33 @@ Panel {
   // muting a single channel from the row below flipping the master switch.
   function toggleAllMuted() {
     if (directDeviceMutationBusy) {
-      defaultOutputError = "Audio is applying another change; retry in a moment"
-      return
+      return rejectAudioAction("Audio is applying another change; retry in a moment")
     }
     var mute = anyAudible
-    if (hasOutput) setAudioNodeMuted(volumeSink, mute)
-    if (hasInput) setAudioNodeMuted(source, mute)
+    var outputOk = !hasOutput || setAudioNodeMuted(volumeSink, mute)
+    var inputOk = !hasInput || setAudioNodeMuted(source, mute)
+    if (!outputOk || !inputOk)
+      return rejectAudioAction("An audio device just changed; check its mute state and retry")
+    clearInteractionError()
   }
 
 
   function setDefaultDevice(node, previous, direction) {
-    var fail = direction === "output"
-      ? function(message) { defaultOutputError = message }
-      : function(message) { defaultInputError = message }
     if (!mutableAudioNode(node)) {
-      fail("That device just changed; wait a moment and retry")
-      return false
+      return rejectAudioAction("That device just changed; wait a moment and retry")
     }
     if (sceneController.busy || routeMutationBusy) {
-      fail("Audio is applying another change; retry in a moment")
-      return false
+      return rejectAudioAction("Audio is applying another change; retry in a moment")
     }
     var identity = audioService.identityForNode(node)
     if (!identity) {
-      fail("Device snapshot is stale; wait a moment and retry")
-      return false
+      return rejectAudioAction("Device snapshot is stale; wait a moment and retry")
     }
     // A previous default that already left the graph cannot be resolved here.
     // The backend recomputes it from routing state, so a stale previous must
     // never block the whole switch.
     var previousIdentity = previous ? audioService.identityForNode(previous) : null
+    clearInteractionError()
     if (direction === "output") defaultOutputError = ""
     else defaultInputError = ""
     defaultSetPending = true
@@ -1101,6 +1125,7 @@ Panel {
       showSceneFeedback("Audio is applying another change; retry in a moment", true)
       return
     }
+    clearInteractionError()
     sceneController.apply(scene)
   }
 
@@ -1285,7 +1310,6 @@ Panel {
                 horizontalPadding: Style.space(5)
                 verticalPadding: Style.space(2)
                 hasCursor: root.settingsHeaderHasCursor
-                enabled: !root.sceneMutationBusy
                 anchors.verticalCenter: parent.verticalCenter
                 onHovered: function(on) { if (on) root.setHeaderCursor(0) }
                 onClicked: root.openAdvancedAudio()
@@ -1398,9 +1422,8 @@ Panel {
 
                   MouseArea {
                     anchors.fill: parent
-                    enabled: !root.sceneMutationBusy
                     hoverEnabled: true
-                    cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                    cursorShape: Qt.PointingHandCursor
                     onContainsMouseChanged: if (containsMouse) {
                       root.cursorActive = true
                       root.focusSection = "scenes"

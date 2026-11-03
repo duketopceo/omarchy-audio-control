@@ -1,12 +1,9 @@
-import QtQuick
+import QtQuick 6.11
 import qs.Ui
 import qs.Commons
-import qs.Commons as Commons
 import "../core/Model.js" as Model
 
-// Output device row — cursor target inside the "output" section. Mouse
-// hover claims the panel cursor via the claimed() signal; visuals come
-// entirely from hasCursor/current via CursorSurface, never from containsMouse.
+// Input device row — sibling of AudioSinkRow for the "input" section.
 CursorSurface {
   id: root
 
@@ -14,9 +11,7 @@ CursorSurface {
   required property int rowIndex
   required property var bar
   required property string preferredName
-  required property bool defaultSetBusy
   required property string label
-  required property bool outputGroup
 
   signal claimed(string section, int index)
   signal activated(var node)
@@ -38,7 +33,7 @@ CursorSurface {
 
     Text {
       textFormat: Text.PlainText
-      text: Model.sinkGlyph(root.node)
+      text: Model.sourceGlyph(root.node)
       color: root.bar.foreground
       font.family: root.bar.fontFamily
       font.pixelSize: Style.font.title
@@ -56,29 +51,15 @@ CursorSurface {
       font.bold: root.isActive
       elide: Text.ElideRight
       width: parent.width - Style.space(22) - Style.space(8)
-        - (groupTag.visible ? groupTag.implicitWidth + Style.space(8) : 0)
-      anchors.verticalCenter: parent.verticalCenter
-    }
-
-    Text {
-      textFormat: Text.PlainText
-      id: groupTag
-      visible: root.outputGroup
-      text: "GROUP"
-      color: Commons.Color.accent
-      font.family: root.bar.fontFamily
-      font.pixelSize: Style.font.caption
-      font.bold: true
       anchors.verticalCenter: parent.verticalCenter
     }
   }
 
   MouseArea {
     anchors.fill: parent
-    enabled: !root.defaultSetBusy
     hoverEnabled: true
-    cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
-    onContainsMouseChanged: if (containsMouse) root.claimed("output", root.rowIndex)
+    cursorShape: Qt.PointingHandCursor
+    onContainsMouseChanged: if (containsMouse) root.claimed("input", root.rowIndex)
     onClicked: root.activated(root.node)
   }
 }
